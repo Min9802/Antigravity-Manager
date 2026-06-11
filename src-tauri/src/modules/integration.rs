@@ -23,12 +23,18 @@ impl SystemIntegration for DesktopIntegration {
     async fn on_account_switch(&self, account: &crate::models::Account, target_ide: Option<&str>) -> Result<(), String> {
         crate::modules::logger::log_info(&format!("[Desktop] Executing system switch for: {} (target_ide: {:?})", account.email, target_ide));
         
-        // 1. 先关闭外部正在运行的进程（无论是原生还是IDE，先安全关闭，避免文件或凭据冲突）
+        // 1. Resolve paths first while the process is still running (to capture custom user-data-dir and active portable paths)
+        let db_path = db::get_db_path(target_ide)?;
+        let storage_path = device::get_storage_path(target_ide)?;
+
+        // 2. 先关闭外部正在运行的进程（无论是原生还是IDE，先安全关闭，避免文件或凭据冲突）
         if process::is_antigravity_running(target_ide) {
             process::close_antigravity(20, target_ide)?;
         }
 
-        // 2. 智能决策：是否使用最新的系统 Keychain 凭据管理器方式存储 Token
+        // 3. 智能决策：是否使用 system keyring 方式存储 Token
+        // IDE 目标（Antigravity IDE）不支持 Keyring，只支持 SQLite 数据库注入。
+        // 只有新版本原生应用（>= 2.0.0）才使用 system keyring / credential-store 路径。
         let is_ide = target_ide == Some("ide");
         let mut use_keyring = false;
 
@@ -51,7 +57,7 @@ impl SystemIntegration for DesktopIntegration {
                     }
                 }
                 Err(e) => {
-                    // 如果探测失败，为防止对最新版由于没有 storage.json 造成报错阻断，默认作为新凭据注入
+                    // 如果探测失败，为了对最新版原生应用（无 storage.json）做兼容，默认作为新凭据注入 Keyring
                     use_keyring = true;
                     crate::modules::logger::log_warn(&format!(
                         "[Desktop] Failed to detect Antigravity version ({}), defaulting to system Keyring for robustness.",
@@ -63,27 +69,21 @@ impl SystemIntegration for DesktopIntegration {
 
         if use_keyring {
             // ================== 最新版 Antigravity 原生应用逻辑 (>= 2.0.0) ==================
-            // 2.1 写入系统 Keychain/Keyring
+            // 3.1 写入系统 Keychain/Keyring
             write_to_system_keyring(account)?;
 
-            // 2.2 原生应用可能没有 storage.json，但如果有的话，我们也可以尝试安全地写入设备 Profile，以兼容指纹信息
-            if let Ok(storage_path) = device::get_storage_path(target_ide) {
-                if let Some(ref profile) = account.device_profile {
-                    let _ = device::write_profile(&storage_path, profile);
-                }
+            // 3.2 原生应用可能没有 storage.json，但如果有的话，我们也可以尝试安全地写入设备 Profile，以兼容指纹信息
+            if let Some(ref profile) = account.device_profile {
+                let _ = device::write_profile(&storage_path, profile);
             }
         } else {
             // ================== 原有 Antigravity 旧版或定制 IDE 逻辑 (< 2.0.0) ==================
-            // 2.1 获取存储路径
-            let storage_path = device::get_storage_path(target_ide)?;
-
-            // 2.2 写入设备 Profile
+            // 3.2 写入设备 Profile
             if let Some(ref profile) = account.device_profile {
                 device::write_profile(&storage_path, profile)?;
             }
 
-            // 2.3 数据库处理与 Token 注入
-            let db_path = db::get_db_path(target_ide)?;
+            // 3.3 数据库处理与 Token 注入
             if db_path.exists() {
                 let backup_path = db_path.with_extension("vscdb.backup");
                 let _ = fs::copy(&db_path, &backup_path);
@@ -100,6 +100,7 @@ impl SystemIntegration for DesktopIntegration {
                 account.token.id_token.as_deref(),
                 account.token.oauth_client_key.as_deref(),
                 target_ide,
+                account.name.as_deref(),
             )?;
             
             // 2.4 同步 Service Machine ID 到数据库

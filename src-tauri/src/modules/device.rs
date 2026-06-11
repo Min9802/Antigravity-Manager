@@ -92,6 +92,7 @@ pub fn get_storage_dir() -> Result<PathBuf, String> {
 }
 
 /// Get state.vscdb path (same directory as storage.json)
+#[allow(dead_code)]
 pub fn get_state_db_path() -> Result<PathBuf, String> {
     let dir = get_storage_dir()?;
     Ok(dir.join("state.vscdb"))
@@ -218,7 +219,11 @@ pub fn write_profile(storage_path: &Path, profile: &DeviceProfile) -> Result<(),
     logger::log_info(&format!("device_profile_written to {:?}", storage_path));
 
     // Sync ItemTable.storage.serviceMachineId in state.vscdb
-    let _ = sync_state_service_machine_id_value(&profile.dev_device_id);
+    let db_path = storage_path
+        .parent()
+        .map(|p| p.join("state.vscdb"))
+        .ok_or_else(|| "failed_to_get_storage_parent_dir".to_string())?;
+    let _ = sync_state_service_machine_id_value(&db_path, &profile.dev_device_id);
     Ok(())
 }
 
@@ -242,7 +247,11 @@ pub fn sync_service_machine_id(storage_path: &Path, service_id: &str) -> Result<
     fs::write(storage_path, updated).map_err(|e| format!("write_failed: {}", e))?;
     logger::log_info("service_machine_id_synced");
 
-    let _ = sync_state_service_machine_id_value(service_id);
+    let db_path = storage_path
+        .parent()
+        .map(|p| p.join("state.vscdb"))
+        .ok_or_else(|| "failed_to_get_storage_parent_dir".to_string())?;
+    let _ = sync_state_service_machine_id_value(&db_path, service_id);
     Ok(())
 }
 
@@ -290,11 +299,14 @@ pub fn sync_service_machine_id_from_storage(storage_path: &Path) -> Result<(), S
         logger::log_info("service_machine_id_added");
     }
 
-    sync_state_service_machine_id_value(&service_id)
+    let db_path = storage_path
+        .parent()
+        .map(|p| p.join("state.vscdb"))
+        .ok_or_else(|| "failed_to_get_storage_parent_dir".to_string())?;
+    sync_state_service_machine_id_value(&db_path, &service_id)
 }
 
-fn sync_state_service_machine_id_value(service_id: &str) -> Result<(), String> {
-    let db_path = get_state_db_path()?;
+fn sync_state_service_machine_id_value(db_path: &Path, service_id: &str) -> Result<(), String> {
     if !db_path.exists() {
         logger::log_warn(&format!(
             "state_db_missing: {:?}",

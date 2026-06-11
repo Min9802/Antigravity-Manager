@@ -4,10 +4,18 @@ use std::path::PathBuf;
 
 fn get_antigravity_path(target_ide: Option<&str>) -> Option<PathBuf> {
     if let Ok(config) = crate::modules::config::load_app_config() {
-        if let Some(path_str) = config.antigravity_executable {
-            let path = PathBuf::from(path_str);
-            if path.exists() {
-                return Some(path);
+        let manual_path = if target_ide == Some("ide") {
+            config.antigravity_ide_executable
+        } else {
+            config.antigravity_executable
+        };
+        if let Some(path_str) = manual_path {
+            let trimmed = path_str.trim().trim_matches('"');
+            if !trimmed.is_empty() {
+                let path = PathBuf::from(trimmed);
+                if path.exists() {
+                    return Some(path);
+                }
             }
         }
     }
@@ -75,6 +83,7 @@ pub fn inject_token(
     id_token: Option<&str>,
     oauth_client_key: Option<&str>,
     target_ide: Option<&str>,
+    name: Option<&str>,
 ) -> Result<String, String> {
     crate::modules::logger::log_info("Starting Token injection...");
     
@@ -114,13 +123,14 @@ pub fn inject_token(
                     is_gcp_tos,
                     project_id,
                     id_token,
+                    name,
                 )
             } else {
                 // < 1.16.5: Use old format only
                 crate::modules::logger::log_info(
                     "Using old format injection (jetskiStateSync.agentManagerInitState)",
                 );
-                inject_old_format(db_path, access_token, refresh_token, expiry, email)
+                inject_old_format(db_path, access_token, refresh_token, expiry, email, name)
             }
         }
         Err(e) => {
@@ -140,10 +150,11 @@ pub fn inject_token(
                 is_gcp_tos,
                 project_id,
                 id_token,
+                name,
             );
             
             // Try old format
-            let old_result = inject_old_format(db_path, access_token, refresh_token, expiry, email);
+            let old_result = inject_old_format(db_path, access_token, refresh_token, expiry, email, name);
             
             // Return success if either format succeeded
             if new_result.is_ok() || old_result.is_ok() {
@@ -169,6 +180,7 @@ fn inject_new_format(
     is_gcp_tos: bool,
     project_id: Option<&str>,
     id_token: Option<&str>,
+    name: Option<&str>,
 ) -> Result<String, String> {
     let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {}", e))?;
     
@@ -197,12 +209,8 @@ fn inject_new_format(
         clear_enterprise_project_preference(&conn)?;
     }
 
-    // Inject Onboarding flag
-    conn.execute(
-        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-        ["antigravityOnboarding", "true"],
-    )
-    .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
+    // Inject Auth Status and Onboarding/Cleanup
+    write_auth_status_and_cleanup(&conn, name, email, access_token)?;
     
     Ok("Token injection successful (new format)".to_string())
 }
@@ -246,6 +254,43 @@ fn clear_enterprise_project_preference(conn: &Connection) -> Result<(), String> 
     Ok(())
 }
 
+fn write_auth_status_and_cleanup(
+    conn: &Connection,
+    name: Option<&str>,
+    email: &str,
+    access_token: &str,
+) -> Result<(), String> {
+    let display_name = name.unwrap_or(email);
+    let auth_status = serde_json::json!({
+        "name": display_name,
+        "email": email,
+        "apiKey": access_token
+    });
+    let auth_status_str = serde_json::to_string(&auth_status)
+        .map_err(|e| format!("Failed to serialize auth status: {}", e))?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityAuthStatus', ?)",
+        [auth_status_str],
+    )
+    .map_err(|e| format!("Failed to write antigravityAuthStatus: {}", e))?;
+
+    conn.execute(
+        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES ('antigravityOnboarding', 'true')",
+        [],
+    )
+    .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
+
+    // Delete legacy/conflict keys
+    conn.execute(
+        "DELETE FROM ItemTable WHERE key = 'google.antigravity'",
+        [],
+    )
+    .map_err(|e| format!("Failed to delete google.antigravity: {}", e))?;
+
+    Ok(())
+}
+
 /// Old format injection (< 1.16.5)
 fn inject_old_format(
     db_path: &PathBuf,
@@ -253,6 +298,7 @@ fn inject_old_format(
     refresh_token: &str,
     expiry: i64,
     email: &str,
+    name: Option<&str>,
 ) -> Result<String, String> {
     use base64::{engine::general_purpose, Engine as _};
     use rusqlite::Error as SqliteError;
@@ -261,54 +307,56 @@ fn inject_old_format(
         .map_err(|e| format!("Failed to open database: {}", e))?;
     
     // Read current data
-    let current_data: String = conn
+    let current_data_result: Result<String, SqliteError> = conn
         .query_row(
             "SELECT value FROM ItemTable WHERE key = ?",
             ["jetskiStateSync.agentManagerInitState"],
             |row| row.get(0),
-        )
-        .map_err(|e| match e {
-            SqliteError::QueryReturnedNoRows => {
-                "Old format key does not exist, possibly new version Antigravity".to_string()
-            }
-            _ => format!("Failed to read data: {}", e),
-        })?;
-    
-    // Base64 decode
-    let blob = general_purpose::STANDARD
-        .decode(&current_data)
-        .map_err(|e| format!("Base64 decoding failed: {}", e))?;
-    
-    // Remove old fields
-    let mut clean_data = protobuf::remove_field(&blob, 1)?; // UserID
-    clean_data = protobuf::remove_field(&clean_data, 2)?;   // Email
-    clean_data = protobuf::remove_field(&clean_data, 6)?;   // OAuthTokenInfo
-    
-    // Create new fields
-    let new_email_field = protobuf::create_email_field(email);
-    let new_oauth_field = protobuf::create_oauth_field(access_token, refresh_token, expiry);
-    
-    // Merge data
-    // We intentionally do NOT re-inject Field 1 (UserID) to force the client 
-    // to re-authenticate the session with the new token.
-    let final_data = [clean_data, new_email_field, new_oauth_field].concat();
-    let final_b64 = general_purpose::STANDARD.encode(&final_data);
-    
-    // Write to database
-    conn.execute(
-        "UPDATE ItemTable SET value = ? WHERE key = ?",
-        [&final_b64, "jetskiStateSync.agentManagerInitState"],
-    )
-    .map_err(|e| format!("Failed to write data: {}", e))?;
-    
-    // Inject Onboarding flag
-    conn.execute(
-        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-        ["antigravityOnboarding", "true"],
-    )
-    .map_err(|e| format!("Failed to write onboarding flag: {}", e))?;
-    
-    Ok("Token injection successful (old format)".to_string())
+        );
+
+    match current_data_result {
+        Ok(current_data) => {
+            // Base64 decode
+            let blob = general_purpose::STANDARD
+                .decode(&current_data)
+                .map_err(|e| format!("Base64 decoding failed: {}", e))?;
+            
+            // Remove old fields
+            let mut clean_data = protobuf::remove_field(&blob, 1)?; // UserID
+            clean_data = protobuf::remove_field(&clean_data, 2)?;   // Email
+            clean_data = protobuf::remove_field(&clean_data, 6)?;   // OAuthTokenInfo
+            
+            // Create new fields
+            let new_email_field = protobuf::create_email_field(email);
+            let new_oauth_field = protobuf::create_oauth_field(access_token, refresh_token, expiry);
+            
+            // Merge data
+            // We intentionally do NOT re-inject Field 1 (UserID) to force the client 
+            // to re-authenticate the session with the new token.
+            let final_data = [clean_data, new_email_field, new_oauth_field].concat();
+            let final_b64 = general_purpose::STANDARD.encode(&final_data);
+            
+            // Write to database
+            conn.execute(
+                "UPDATE ItemTable SET value = ? WHERE key = ?",
+                [&final_b64, "jetskiStateSync.agentManagerInitState"],
+            )
+            .map_err(|e| format!("Failed to write data: {}", e))?;
+            
+            // Inject Auth Status and Onboarding/Cleanup
+            write_auth_status_and_cleanup(&conn, name, email, access_token)?;
+            
+            Ok("Token injection successful (old format)".to_string())
+        }
+        Err(SqliteError::QueryReturnedNoRows) => {
+            crate::modules::logger::log_warn(
+                "jetskiStateSync.agentManagerInitState not found. Injecting minimal auth state only."
+            );
+            write_auth_status_and_cleanup(&conn, name, email, access_token)?;
+            Ok("Token injection successful (old format fallback)".to_string())
+        }
+        Err(e) => Err(format!("Failed to read data: {}", e)),
+    }
 }
 
 /// 注入 Service Machine ID 到数据库，解决 VS Code 缓存指纹不匹配导致 Token 失效的问题

@@ -112,19 +112,26 @@ pub async fn reorder_accounts(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+pub struct SwitchAccountArgs {
+    #[serde(alias = "accountId")]
+    pub account_id: String,
+    #[serde(alias = "targetIde")]
+    pub target_ide: Option<String>,
+}
+
 /// 切换账号
 #[tauri::command]
 pub async fn switch_account(
     app: tauri::AppHandle,
     proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
-    account_id: String,
-    target_ide: Option<String>,
+    args: SwitchAccountArgs,
 ) -> Result<(), String> {
     let service = modules::account_service::AccountService::new(
         crate::modules::integration::SystemManager::Desktop(app.clone()),
     );
 
-    service.switch_account(&account_id, target_ide.as_deref()).await?;
+    service.switch_account(&args.account_id, args.target_ide.as_deref()).await?;
 
     // 同步托盘
     crate::modules::tray::update_tray_menus(&app);

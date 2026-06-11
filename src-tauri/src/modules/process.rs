@@ -13,6 +13,30 @@ fn get_current_exe_path() -> Option<std::path::PathBuf> {
         .and_then(|p| p.canonicalize().ok())
 }
 
+fn clean_path(path: &std::path::Path) -> String {
+    let mut path_str = path.to_string_lossy().to_string();
+    if path_str.starts_with(r"\\?\") {
+        path_str = path_str[4..].to_string();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        path_str = path_str.replace("/", "\\").to_lowercase();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path_str = path_str;
+    }
+    path_str
+}
+
+fn get_clean_canonical_path(path: &std::path::Path) -> String {
+    if let Ok(canonical) = path.canonicalize() {
+        clean_path(&canonical)
+    } else {
+        clean_path(path)
+    }
+}
+
 /// Helper to extract executable paths of Antigravity IDE instances
 /// Uses config path as primary, and falls back to cmd() arg scanning (works on macOS/Linux)
 fn get_ide_exe_paths(system: &System) -> std::collections::HashSet<String> {
@@ -21,11 +45,7 @@ fn get_ide_exe_paths(system: &System) -> std::collections::HashSet<String> {
     // Primary: load from explicit config setting (most reliable on Windows)
     if let Ok(config) = crate::modules::config::load_app_config() {
         if let Some(ide_path) = config.antigravity_ide_executable {
-            if let Ok(canonical) = std::path::PathBuf::from(&ide_path).canonicalize() {
-                immune_exe_paths.insert(canonical.to_string_lossy().to_lowercase());
-            } else {
-                immune_exe_paths.insert(ide_path.to_lowercase());
-            }
+            immune_exe_paths.insert(get_clean_canonical_path(&std::path::PathBuf::from(&ide_path)));
         }
     }
 
@@ -39,8 +59,8 @@ fn get_ide_exe_paths(system: &System) -> std::collections::HashSet<String> {
             .join(" ");
         
         if args_str.contains("antigravity ide") || args_str.contains("antigravity-ide") {
-            if let Some(exe_path) = process.exe().and_then(|p| p.to_str()) {
-                immune_exe_paths.insert(exe_path.to_lowercase());
+            if let Some(exe_path) = process.exe() {
+                immune_exe_paths.insert(get_clean_canonical_path(exe_path));
             }
         }
     }
@@ -49,8 +69,8 @@ fn get_ide_exe_paths(system: &System) -> std::collections::HashSet<String> {
 
 /// Check if Antigravity is running
 pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
-    let mut system = System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+    let mut system = System::new_all();
+    system.refresh_all();
     let ide_exe_paths = get_ide_exe_paths(&system);
 
     let current_exe = get_current_exe_path();
@@ -60,10 +80,10 @@ pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
     let config = crate::modules::config::load_app_config().ok();
     let manual_path = config.as_ref()
         .and_then(|c| c.antigravity_executable.as_ref())
-        .and_then(|p| std::path::PathBuf::from(p).canonicalize().ok());
+        .map(|p| std::path::PathBuf::from(p));
     let ide_manual_path = config.as_ref()
         .and_then(|c| c.antigravity_ide_executable.as_ref())
-        .and_then(|p| std::path::PathBuf::from(p).canonicalize().ok());
+        .map(|p| std::path::PathBuf::from(p));
 
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
@@ -72,18 +92,12 @@ pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
         }
 
         let name = process.name().to_string_lossy().to_lowercase();
-        let exe_path = process
-            .exe()
-            .and_then(|p| p.to_str())
-            .unwrap_or("")
-            .to_lowercase();
+        let p_exe_path = process.exe();
 
         // Exclude own path (handles case where manager is mistaken for Antigravity on Linux)
-        if let (Some(ref my_path), Some(p_exe)) = (&current_exe, process.exe()) {
-            if let Ok(p_path) = p_exe.canonicalize() {
-                if my_path == &p_path {
-                    continue;
-                }
+        if let (Some(ref my_path), Some(p_exe)) = (&current_exe, p_exe_path) {
+            if get_clean_canonical_path(my_path) == get_clean_canonical_path(p_exe) {
+                continue;
             }
         }
 
@@ -104,7 +118,7 @@ pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
             || name.contains("utility")
             || name.contains("audio")
             || name.contains("sandbox")
-            || exe_path.contains("crashpad");
+            || p_exe_path.map(|p| p.to_string_lossy().to_lowercase().contains("crashpad")).unwrap_or(false);
 
         if is_helper {
             continue;
@@ -112,48 +126,72 @@ pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
 
         // Recognition ref 2: If targeting IDE and ide_manual_path is configured, check it first
         if target_ide == Some("ide") {
-            if let (Some(ref ide_m_path), Some(p_exe)) = (&ide_manual_path, process.exe()) {
-                if let Ok(p_path) = p_exe.canonicalize() {
+            if let Some(ref ide_m_path) = ide_manual_path {
+                let mut matched = false;
+                if let Some(p_exe) = p_exe_path {
                     #[cfg(target_os = "macos")]
                     {
                         let m = ide_m_path.to_string_lossy();
-                        let p = p_path.to_string_lossy();
+                        let p = p_exe.to_string_lossy();
                         if let (Some(mi), Some(pi)) = (m.find(".app"), p.find(".app")) {
                             if m[..mi + 4] == p[..pi + 4] {
-                                return true;
+                                matched = true;
                             }
                         }
                     }
                     #[cfg(not(target_os = "macos"))]
-                    if ide_m_path == &p_path {
-                        return true;
+                    if get_clean_canonical_path(ide_m_path) == get_clean_canonical_path(p_exe) {
+                        matched = true;
                     }
+                }
+                if !matched {
+                    if let Some(filename) = ide_m_path.file_name().and_then(|f| f.to_str()) {
+                        let fn_lower = filename.to_lowercase();
+                        if name == fn_lower || name.contains(&fn_lower) || args_str.contains(&fn_lower) {
+                            matched = true;
+                        }
+                    }
+                }
+                if matched {
+                    return true;
                 }
             }
         }
 
         // Recognition ref 3: Priority check for manual path match (client)
         if target_ide != Some("ide") {
-            if let (Some(ref m_path), Some(p_exe)) = (&manual_path, process.exe()) {
-                if let Ok(p_path) = p_exe.canonicalize() {
+            if let Some(ref m_path) = manual_path {
+                let mut matched = false;
+                if let Some(p_exe) = p_exe_path {
                     // macOS: Check if within the same .app bundle
                     #[cfg(target_os = "macos")]
                     {
                         let m_path_str = m_path.to_string_lossy();
-                        let p_path_str = p_path.to_string_lossy();
+                        let p_path_str = p_exe.to_string_lossy();
                         if let (Some(m_idx), Some(p_idx)) =
                             (m_path_str.find(".app"), p_path_str.find(".app"))
                         {
                             if m_path_str[..m_idx + 4] == p_path_str[..p_idx + 4] {
-                                return true;
+                                matched = true;
                             }
                         }
                     }
 
                     #[cfg(not(target_os = "macos"))]
-                    if m_path == &p_path {
-                        return true;
+                    if get_clean_canonical_path(m_path) == get_clean_canonical_path(p_exe) {
+                        matched = true;
                     }
+                }
+                if !matched {
+                    if let Some(filename) = m_path.file_name().and_then(|f| f.to_str()) {
+                        let fn_lower = filename.to_lowercase();
+                        if name == fn_lower || name.contains(&fn_lower) || args_str.contains(&fn_lower) {
+                            matched = true;
+                        }
+                    }
+                }
+                if matched {
+                    return true;
                 }
             }
         }
@@ -167,16 +205,19 @@ pub fn is_antigravity_running(target_ide: Option<&str>) -> bool {
             continue;
         }
 
+        let p_exe_str = p_exe_path.map(|p| get_clean_canonical_path(p)).unwrap_or_default();
+
         // Check if the process matches target_ide
         let is_ide_match = if target_ide == Some("ide") {
-            exe_path.contains("antigravity ide") || exe_path.contains("antigravity-ide") || name.contains("antigravity ide") || name.contains("antigravity-ide") || ide_exe_paths.contains(&exe_path)
+            p_exe_str.contains("antigravity ide") || p_exe_str.contains("antigravity-ide") || name.contains("antigravity ide") || name.contains("antigravity-ide") || (p_exe_path.is_some() && ide_exe_paths.contains(&get_clean_canonical_path(p_exe_path.unwrap())))
         } else {
-            if ide_exe_paths.contains(&exe_path) {
+            let matches_ide_exe = p_exe_path.is_some() && ide_exe_paths.contains(&get_clean_canonical_path(p_exe_path.unwrap()));
+            if matches_ide_exe {
                 false // Explicitly immune (it is an IDE)
             } else {
-                (exe_path.contains("antigravity") || name.contains("antigravity"))
-                    && !exe_path.contains("antigravity ide")
-                    && !exe_path.contains("antigravity-ide")
+                (p_exe_str.contains("antigravity") || name.contains("antigravity"))
+                    && !p_exe_str.contains("antigravity ide")
+                    && !p_exe_str.contains("antigravity-ide")
                     && !name.contains("antigravity ide")
                     && !name.contains("antigravity-ide")
             }
@@ -246,9 +287,8 @@ fn get_self_family_pids(system: &sysinfo::System) -> std::collections::HashSet<u
 
 /// Get PIDs of all Antigravity processes (including main and helper processes)
 fn get_antigravity_pids(target_ide: Option<&str>) -> Vec<u32> {
-    let mut system = System::new();
-    system.refresh_processes(sysinfo::ProcessesToUpdate::All);
-    let ide_exe_paths = get_ide_exe_paths(&system);
+    let mut system = System::new_all();
+    system.refresh_all();
 
     // Linux: Enable family process tree exclusion
     #[cfg(target_os = "linux")]
@@ -259,13 +299,14 @@ fn get_antigravity_pids(target_ide: Option<&str>) -> Vec<u32> {
     let current_exe = get_current_exe_path();
 
     // Load both manual paths from config
+    // Load both manual paths from config
     let config = crate::modules::config::load_app_config().ok();
     let manual_path = config.as_ref()
         .and_then(|c| c.antigravity_executable.as_ref())
-        .and_then(|p| std::path::PathBuf::from(p).canonicalize().ok());
+        .map(|p| std::path::PathBuf::from(p));
     let ide_manual_path = config.as_ref()
         .and_then(|c| c.antigravity_ide_executable.as_ref())
-        .and_then(|p| std::path::PathBuf::from(p).canonicalize().ok());
+        .map(|p| std::path::PathBuf::from(p));
 
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
@@ -277,14 +318,17 @@ fn get_antigravity_pids(target_ide: Option<&str>) -> Vec<u32> {
 
         // Exclude own executable path (hardened against broad name matching)
         if let (Some(ref my_path), Some(p_exe)) = (&current_exe, process.exe()) {
-            if let Ok(p_path) = p_exe.canonicalize() {
-                if my_path == &p_path {
-                    continue;
-                }
+            if get_clean_canonical_path(my_path) == get_clean_canonical_path(p_exe) {
+                continue;
             }
         }
 
         let name = process.name().to_string_lossy().to_lowercase();
+        let exe_path = process
+            .exe()
+            .and_then(|p| p.to_str())
+            .unwrap_or("")
+            .to_lowercase();
 
         #[cfg(target_os = "linux")]
         {
@@ -306,92 +350,63 @@ fn get_antigravity_pids(target_ide: Option<&str>) -> Vec<u32> {
             }
         }
 
-        // Recognition ref IDE manual path: If the process exactly matches the configured IDE path,
-        // NEVER add it to kill list regardless of target_ide
-        if let (Some(ref ide_m_path), Some(p_exe)) = (&ide_manual_path, process.exe()) {
-            if let Ok(p_path) = p_exe.canonicalize() {
+        // Identify if it matches the IDE target
+        let mut is_ide = false;
+        if let Some(ref ide_m_path) = ide_manual_path {
+            if let Some(p_exe) = process.exe() {
                 #[cfg(target_os = "macos")]
-                let matches = {
+                {
                     let m = ide_m_path.to_string_lossy();
-                    let p = p_path.to_string_lossy();
-                    matches!(m.find(".app").zip(p.find(".app")), Some((mi, pi)) if m[..mi + 4] == p[..pi + 4])
-                };
-                #[cfg(not(target_os = "macos"))]
-                let matches = ide_m_path == &p_path;
-
-                if matches && target_ide != Some("ide") {
-                    // This is explicitly the IDE we must NOT kill when switching client
-                    continue;
+                    let p = p_exe.to_string_lossy();
+                    is_ide = matches!(m.find(".app").zip(p.find(".app")), Some((mi, pi)) if m[..mi + 4] == p[..pi + 4]);
                 }
-                if matches && target_ide == Some("ide") {
-                    // This is the IDE we WANT to close
-                    pids.push(pid_u32);
-                    continue;
+                #[cfg(not(target_os = "macos"))]
+                {
+                    is_ide = get_clean_canonical_path(ide_m_path) == get_clean_canonical_path(p_exe);
                 }
             }
+            if !is_ide {
+                if let Some(filename) = ide_m_path.file_name().and_then(|f| f.to_str()) {
+                    let fn_lower = filename.to_lowercase();
+                    is_ide = name == fn_lower || name.contains(&fn_lower) || exe_path.contains(&fn_lower);
+                }
+            }
+        } else {
+            is_ide = name.contains("antigravity ide") || name.contains("antigravity-ide") || name.contains("antigravity_ide") || exe_path.contains("antigravity ide") || exe_path.contains("antigravity-ide") || exe_path.contains("antigravity_ide");
         }
 
-        // Recognition ref 3: Check manual config path match (client)
-        if let (Some(ref m_path), Some(p_exe)) = (&manual_path, process.exe()) {
-            if let Ok(p_path) = p_exe.canonicalize() {
+        // Identify if it matches the Classic target
+        let mut is_classic = false;
+        if let Some(ref m_path) = manual_path {
+            if let Some(p_exe) = process.exe() {
                 #[cfg(target_os = "macos")]
-                let matches = {
-                    let m_path_str = m_path.to_string_lossy();
-                    let p_path_str = p_path.to_string_lossy();
-                    matches!(m_path_str.find(".app").zip(p_path_str.find(".app")), Some((m_idx, p_idx)) if m_path_str[..m_idx + 4] == p_path_str[..p_idx + 4])
-                };
+                {
+                    let m = m_path.to_string_lossy();
+                    let p = p_exe.to_string_lossy();
+                    is_classic = matches!(m.find(".app").zip(p.find(".app")), Some((mi, pi)) if m[..mi + 4] == p[..pi + 4]);
+                }
                 #[cfg(not(target_os = "macos"))]
-                let matches = m_path == &p_path;
-
-                if matches {
-                    #[cfg(target_os = "macos")]
-                    let is_main = {
-                        let args = process.cmd();
-                        let is_helper_by_args = args
-                            .iter()
-                            .any(|arg| arg.to_string_lossy().contains("--type="));
-                        let is_helper_by_name = name.contains("helper")
-                            || name.contains("plugin")
-                            || name.contains("renderer")
-                            || name.contains("gpu")
-                            || name.contains("crashpad")
-                            || name.contains("utility")
-                            || name.contains("audio")
-                            || name.contains("sandbox");
-                        !is_helper_by_args && !is_helper_by_name
-                    };
-                    #[cfg(not(target_os = "macos"))]
-                    let is_main = true;
-
-                    if is_main {
-                        if target_ide == Some("ide") {
-                            // This is explicitly the client we must NOT kill when switching IDE
-                            continue;
-                        } else {
-                            // This is the client we WANT to close
-                            pids.push(pid_u32);
-                            continue;
-                        }
-                    }
+                {
+                    is_classic = get_clean_canonical_path(m_path) == get_clean_canonical_path(p_exe);
                 }
             }
+            if !is_classic {
+                if let Some(filename) = m_path.file_name().and_then(|f| f.to_str()) {
+                    let fn_lower = filename.to_lowercase();
+                    is_classic = name == fn_lower || name.contains(&fn_lower) || exe_path.contains(&fn_lower);
+                }
+            }
+        } else {
+            is_classic = (name.contains("antigravity") || exe_path.contains("antigravity")) && !is_ide;
         }
 
-        // 4. Strict mode: If the relevant manual path is configured, we strictly enforce it
-        // and DO NOT fallback to fuzzy string matching.
-        if manual_path.is_some() && target_ide != Some("ide") {
+        // Immunity check: if it belongs to the opposite target, immune from being killed
+        if target_ide == Some("ide") && is_classic {
             continue;
         }
-        if ide_manual_path.is_some() && target_ide == Some("ide") {
+        if target_ide != Some("ide") && is_ide {
             continue;
         }
-
-        // Get executable path
-        let exe_path = process
-            .exe()
-            .and_then(|p| p.to_str())
-            .unwrap_or("")
-            .to_lowercase();
 
         // Common helper process exclusion logic
         let args = process.cmd();
@@ -412,23 +427,12 @@ fn get_antigravity_pids(target_ide: Option<&str>) -> Vec<u32> {
             || name.contains("sandbox")
             || exe_path.contains("crashpad");
 
-        // Check if the process matches target_ide
-        let is_ide_match = if target_ide == Some("ide") {
-            exe_path.contains("antigravity ide") || exe_path.contains("antigravity-ide") || name.contains("antigravity ide") || name.contains("antigravity-ide") || ide_exe_paths.contains(&exe_path)
-        } else {
-            if ide_exe_paths.contains(&exe_path) {
-                false // Explicitly immune (it is an IDE)
-            } else {
-                (exe_path.contains("antigravity") || name.contains("antigravity"))
-                    && !exe_path.contains("antigravity ide")
-                    && !exe_path.contains("antigravity-ide")
-                    && !name.contains("antigravity ide")
-                    && !name.contains("antigravity-ide")
+        if !is_helper {
+            if target_ide == Some("ide") && is_ide {
+                pids.push(pid_u32);
+            } else if target_ide != Some("ide") && is_classic {
+                pids.push(pid_u32);
             }
-        };
-
-        if is_ide_match && !is_helper {
-            pids.push(pid_u32);
         }
     }
 
@@ -454,12 +458,12 @@ pub fn close_antigravity(timeout_secs: u64, target_ide: Option<&str>) -> Result<
         let pids = get_antigravity_pids(target_ide);
         if !pids.is_empty() {
             crate::modules::logger::log_info(&format!(
-                "Precisely closing {} identified processes on Windows...",
+                "Precisely closing {} identified process trees on Windows...",
                 pids.len()
             ));
             for pid in pids {
                 let _ = Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
+                    .args(["/F", "/T", "/PID", &pid.to_string()])
                     .creation_flags(0x08000000) // CREATE_NO_WINDOW
                     .output();
             }
@@ -476,8 +480,8 @@ pub fn close_antigravity(timeout_secs: u64, target_ide: Option<&str>) -> Result<
         let pids = get_antigravity_pids(target_ide);
         if !pids.is_empty() {
             // 1. Identify main process (PID)
-            let mut system = System::new();
-            system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+            let mut system = System::new_all();
+            system.refresh_all();
 
             let mut main_pid = None;
 
@@ -643,8 +647,8 @@ pub fn close_antigravity(timeout_secs: u64, target_ide: Option<&str>) -> Result<
         // Linux: precise closing
         let pids = get_antigravity_pids(target_ide);
         if !pids.is_empty() {
-            let mut system = System::new();
-            system.refresh_processes(sysinfo::ProcessesToUpdate::All);
+            let mut system = System::new_all();
+            system.refresh_all();
 
             let mut main_pid = None;
 
@@ -738,16 +742,25 @@ pub fn close_antigravity(timeout_secs: u64, target_ide: Option<&str>) -> Result<
 pub fn start_antigravity(target_ide: Option<&str>) -> Result<(), String> {
     crate::modules::logger::log_info(&format!("Starting Antigravity ({:?})...", target_ide));
 
-    // Prefer manually specified path and args from configuration
+    // Prefer manually specified path and args from configuration.
+    // If the caller did not explicitly target the IDE, still allow a configured IDE path
+    // to be used as a fallback so Windows installs with only the IDE path configured can start.
     let config = crate::modules::config::load_app_config().ok();
     let manual_path = if target_ide == Some("ide") {
-        config.as_ref().and_then(|c| c.antigravity_ide_executable.clone())
+        config
+            .as_ref()
+            .and_then(|c| c.antigravity_ide_executable.clone())
+            .or_else(|| config.as_ref().and_then(|c| c.antigravity_executable.clone()))
     } else {
-        config.as_ref().and_then(|c| c.antigravity_executable.clone())
+        config
+            .as_ref()
+            .and_then(|c| c.antigravity_executable.clone())
+            .or_else(|| config.as_ref().and_then(|c| c.antigravity_ide_executable.clone()))
     };
     let args = config.and_then(|c| c.antigravity_args.clone());
 
     if let Some(mut path_str) = manual_path {
+        path_str = path_str.trim().trim_matches('"').to_string();
         let mut path = std::path::PathBuf::from(&path_str);
 
         #[cfg(target_os = "macos")]
@@ -887,6 +900,15 @@ fn get_process_info(target_ide: Option<&str>) -> (Option<std::path::PathBuf>, Op
     let current_exe = get_current_exe_path();
     let current_pid = std::process::id();
 
+    // Load both manual paths from config
+    let config = crate::modules::config::load_app_config().ok();
+    let manual_path = config.as_ref()
+        .and_then(|c| c.antigravity_executable.as_ref())
+        .map(|p| std::path::PathBuf::from(p));
+    let ide_manual_path = config.as_ref()
+        .and_then(|c| c.antigravity_ide_executable.as_ref())
+        .map(|p| std::path::PathBuf::from(p));
+
     for (pid, process) in system.processes() {
         let pid_u32 = pid.as_u32();
         if pid_u32 == current_pid {
@@ -939,14 +961,72 @@ fn get_process_info(target_ide: Option<&str>) -> (Option<std::path::PathBuf>, Op
             let args = Some(args);
 
             // Is the process a match for target_ide?
-            let is_ide_match = if target_ide == Some("ide") {
-                exe_path.contains("antigravity ide") || exe_path.contains("antigravity-ide") || name.contains("antigravity ide") || name.contains("antigravity-ide")
+            let mut is_ide = false;
+            if let Some(ref ide_m_path) = ide_manual_path {
+                let mut matched = false;
+                #[cfg(target_os = "macos")]
+                {
+                    let m = ide_m_path.to_string_lossy();
+                    let p = exe.to_string_lossy();
+                    if let (Some(mi), Some(pi)) = (m.find(".app"), p.find(".app")) {
+                        if m[..mi + 4] == p[..pi + 4] {
+                            matched = true;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                if get_clean_canonical_path(ide_m_path) == get_clean_canonical_path(exe) {
+                    matched = true;
+                }
+                if !matched {
+                    if let Some(filename) = ide_m_path.file_name().and_then(|f| f.to_str()) {
+                        let fn_lower = filename.to_lowercase();
+                        if name == fn_lower || name.contains(&fn_lower) || args_str.contains(&fn_lower) {
+                            matched = true;
+                        }
+                    }
+                }
+                is_ide = matched;
             } else {
-                (exe_path.contains("antigravity") || name.contains("antigravity"))
-                    && !exe_path.contains("antigravity ide")
-                    && !exe_path.contains("antigravity-ide")
-                    && !name.contains("antigravity ide")
-                    && !name.contains("antigravity-ide")
+                is_ide = exe_path.contains("antigravity ide") || exe_path.contains("antigravity-ide") || name.contains("antigravity ide") || name.contains("antigravity-ide");
+            }
+
+            let mut is_classic = false;
+            if let Some(ref m_path) = manual_path {
+                let mut matched = false;
+                #[cfg(target_os = "macos")]
+                {
+                    let m_path_str = m_path.to_string_lossy();
+                    let p_path_str = exe.to_string_lossy();
+                    if let (Some(m_idx), Some(p_idx)) =
+                        (m_path_str.find(".app"), p_path_str.find(".app"))
+                    {
+                        if m_path_str[..m_idx + 4] == p_path_str[..p_idx + 4] {
+                            matched = true;
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                if get_clean_canonical_path(m_path) == get_clean_canonical_path(exe) {
+                    matched = true;
+                }
+                if !matched {
+                    if let Some(filename) = m_path.file_name().and_then(|f| f.to_str()) {
+                        let fn_lower = filename.to_lowercase();
+                        if name == fn_lower || name.contains(&fn_lower) || args_str.contains(&fn_lower) {
+                            matched = true;
+                        }
+                    }
+                }
+                is_classic = matched;
+            } else {
+                is_classic = (exe_path.contains("antigravity") || name.contains("antigravity")) && !is_ide;
+            }
+
+            let is_ide_match = if target_ide == Some("ide") {
+                is_ide
+            } else {
+                is_classic
             };
 
             if is_ide_match && !is_helper {
@@ -1052,6 +1132,24 @@ pub fn get_user_data_dir_from_process(target_ide: Option<&str>) -> Option<std::p
 /// 2. Iterate standard installation locations
 /// 3. Return None
 pub fn get_antigravity_executable_path(target_ide: Option<&str>) -> Option<std::path::PathBuf> {
+    // Strategy 0: Check manually configured paths from configuration first
+    if let Ok(config) = crate::modules::config::load_app_config() {
+        let manual_path = if target_ide == Some("ide") {
+            config.antigravity_ide_executable
+        } else {
+            config.antigravity_executable
+        };
+        if let Some(path_str) = manual_path {
+            let trimmed = path_str.trim().trim_matches('"');
+            if !trimmed.is_empty() {
+                let path = std::path::PathBuf::from(trimmed);
+                if path.exists() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+
     // Strategy 1: Get from running process (supports any location)
     if let Some(path) = get_path_from_running_process(target_ide) {
         return Some(path);

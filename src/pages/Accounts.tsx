@@ -326,15 +326,24 @@ function Accounts() {
   const [switchingAccountId, setSwitchingAccountId] = useState<string | null>(
     null,
   );
+  const [switchStatus, setSwitchStatus] = useState<{
+    accountId: string;
+    label: string;
+  } | null>(null);
 
   const handleSwitch = async (accountId: string, targetIde?: string) => {
     if (loading || switchingAccountId) return;
 
     setSwitchingAccountId(accountId);
+    const targetLabel = targetIde === 'ide'
+      ? t('accounts.switch_to_ide', '切换到 Antigravity IDE')
+      : t('accounts.switch_to_classic', '切换到 Antigravity (经典版)');
+    setSwitchStatus({ accountId, label: targetLabel });
+
     console.log("[Accounts] handleSwitch called for:", accountId, "targetIde:", targetIde);
     try {
       await switchAccount(accountId, targetIde);
-      showToast(t("common.success"), "success");
+      showToast(t("accounts.switch_success", "Account switched"), "success");
     } catch (error) {
       console.error("[Accounts] Switch failed:", error);
       showToast(`${t("common.error")}: ${error}`, "error");
@@ -342,6 +351,7 @@ function Accounts() {
       // Add a small delay for smoother UX
       setTimeout(() => {
         setSwitchingAccountId(null);
+        setSwitchStatus(null);
       }, 500);
     }
   };
@@ -1047,6 +1057,17 @@ function Accounts() {
           </button>
         </div>
       </div>
+
+      {switchStatus && (
+        <div className="flex-none rounded-xl border border-blue-200 dark:border-blue-900/40 bg-blue-50 dark:bg-blue-950/20 px-4 py-2 text-sm text-blue-700 dark:text-blue-300 flex items-center justify-between gap-3">
+          <span>
+            {t('accounts.switching_account', 'Switching account')} · {switchStatus.label}
+          </span>
+          <span className="text-xs font-medium opacity-80">
+            {switchingAccountId ? accounts.find(a => a.id === switchingAccountId)?.email || switchingAccountId : ''}
+          </span>
+        </div>
+      )}
 
       {/* 账号列表内容区域 */}
       <div className="flex-1 min-h-0 relative" ref={containerRef}>

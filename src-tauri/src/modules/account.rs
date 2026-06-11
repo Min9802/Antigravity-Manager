@@ -944,6 +944,28 @@ pub async fn switch_account(
 ) -> Result<(), String> {
     use crate::modules::oauth;
 
+    // Auto-detect target_ide if not specified (None)
+    let mut resolved_target_ide = target_ide;
+    if resolved_target_ide.is_none() {
+        if let Ok(config) = crate::modules::config::load_app_config() {
+            let has_classic = config.antigravity_executable.as_ref().map_or(false, |p| !p.trim().is_empty() && std::path::Path::new(p).exists());
+            let has_ide = config.antigravity_ide_executable.as_ref().map_or(false, |p| !p.trim().is_empty() && std::path::Path::new(p).exists());
+            
+            if has_ide && !has_classic {
+                crate::modules::logger::log_info("[Switch] Auto-detecting target: only Antigravity IDE is configured, defaulting to IDE.");
+                resolved_target_ide = Some("ide");
+            } else if !has_ide && !has_classic {
+                // If neither is configured in settings, check standard locations
+                let classic_exists = crate::modules::process::get_antigravity_executable_path(None).is_some();
+                let ide_exists = crate::modules::process::get_antigravity_executable_path(Some("ide")).is_some();
+                if ide_exists && !classic_exists {
+                    crate::modules::logger::log_info("[Switch] Auto-detecting target: only Antigravity IDE is installed, defaulting to IDE.");
+                    resolved_target_ide = Some("ide");
+                }
+            }
+        }
+    }
+
     let index = {
         let _lock = ACCOUNT_INDEX_LOCK
             .lock()
@@ -958,8 +980,8 @@ pub async fn switch_account(
 
     let mut account = load_account(account_id)?;
     crate::modules::logger::log_info(&format!(
-        "Switching to account: {} (ID: {}) (target_ide: {:?})",
-        account.email, account.id, target_ide
+        "Switching to account: {} (ID: {}) (target_ide: {:?}, resolved: {:?})",
+        account.email, account.id, target_ide, resolved_target_ide
     ));
 
     // 2. Ensure token is valid before switch. Surface clearer hints for known account-state failures.
@@ -997,7 +1019,7 @@ pub async fn switch_account(
     }
 
     // 3. Execute platform-specific system integration (Close proc, Inject DB, Start proc, etc.)
-    integration.on_account_switch(&account, target_ide).await?;
+    integration.on_account_switch(&account, resolved_target_ide).await?;
 
     // 4. Update tool internal state
     {

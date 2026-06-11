@@ -107,7 +107,10 @@ export const useAccountStore = create<AccountState>((set, get) => ({
         set({ loading: true, error: null });
         try {
             await accountService.switchAccount(accountId, targetIde);
-            await get().fetchCurrentAccount();
+            await Promise.all([
+                get().fetchCurrentAccount(),
+                get().fetchAccounts(),
+            ]);
             set({ loading: false });
         } catch (error) {
             set({ error: String(error), loading: false });
